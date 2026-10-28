@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../actions/seal/SealedFormat.cs" Link="SealedFormat.cs" />
+    <None Include="../vectors/pfs1.json" Link="pfs1.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

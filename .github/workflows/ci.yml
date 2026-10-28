@@ -1,0 +1,64 @@
+name: Check sealed-release helpers
+on:
+  pull_request:
+  push:
+    branches: [main, feat/sealed-tool-release]
+permissions:
+  contents: read
+jobs:
+  workflow-boundaries:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - run: ruby tests/verify-workflows.rb
+  checks:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: 10.0.x
+      - name: Format, tamper, and boundary tests
+        run: dotnet run --project tests/Seal.Tests -c Release -p:RestoreLockedMode=true
+      - name: Parse PowerShell and exercise leak checks
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Get-ChildItem actions -Filter *.ps1 -Recurse | ForEach-Object {
+            $parseErrors = $null
+            [void][Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$parseErrors)
+            if ($parseErrors.Count) { throw 'PowerShell parse failure.' }
+          }
+          $out = New-Item -ItemType Directory "$env:RUNNER_TEMP/leak-fixture"
+          Set-Content "$out/Tool.dll" 'test bytes, never uploaded'
+          ./actions/leak-check/check.ps1 -DllPath "$out/Tool.dll"
+          Set-Content "$out/leak.pdb" 'unexpected file'
+          $refused = $false
+          try { ./actions/leak-check/check.ps1 -DllPath "$out/Tool.dll" } catch { $refused = $true }
+          if (-not $refused) { throw 'Leak check accepted extra files.' }
+      - name: Build helpers from locked dependencies
+        run: |
+          dotnet restore actions/seal/Seal.csproj --locked-mode
+          dotnet build actions/seal/Seal.csproj -c Release --no-restore
+          dotnet restore actions/contract-check/CheckContract.csproj --locked-mode
+          dotnet build actions/contract-check/CheckContract.csproj -c Release --no-restore
+      - name: Rehearse the actual build and seal without publishing
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $helper = "$env:GITHUB_WORKSPACE/actions/build.ps1"
+          $fixture = "$env:RUNNER_TEMP/tool-fixture"
+          New-Item -ItemType Directory $fixture | Out-Null
+          Copy-Item tests/Fixture/* $fixture
+          $env:GITHUB_WORKSPACE = $fixture
+          $env:GITHUB_REF = 'refs/tags/v1.2.0-alpha.1'
+          $env:GITHUB_OUTPUT = "$env:RUNNER_TEMP/rehearsal-output"
+          & $helper -Project Fixture.csproj
+          $sealed = [IO.File]::ReadAllBytes("$env:RUNNER_TEMP/release.pfs")
+          if ([Text.Encoding]::ASCII.GetString($sealed[0..3]) -ne 'PFS1') { throw 'Rehearsal did not produce PFS1.' }
+          if ((Get-Content $env:GITHUB_OUTPUT -Raw) -notmatch 'sealed_sha256=[a-f0-9]{64}') { throw 'Missing sealed digest.' }
+          Remove-Item "$env:RUNNER_TEMP/release.pfs"
