@@ -1,0 +1,36 @@
+name: Bind a Pi-Flow tool
+on:
+  workflow_call:
+    inputs:
+      toolId:
+        type: string
+        required: true
+      adopt:
+        type: boolean
+        default: false
+env:
+  PIFLOW_RELEASE_API: https://piflow-release-api.azurewebsites.net/api
+permissions: {}
+jobs:
+  bind:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - name: Bind this repository once
+        shell: bash
+        env:
+          TOOL_ID: ${{ inputs.toolId }}
+          ADOPT: ${{ inputs.adopt }}
+        run: |
+          set -euo pipefail
+          token="$(curl -fsS --max-time 30 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=pi-flow-tool-release" 2>/dev/null | jq -er '.value' 2>/dev/null)"
+          [[ "$token" =~ ^[A-Za-z0-9_.-]+$ ]]
+          echo "::add-mask::$token"
+          body="$(jq -nc --arg id "$TOOL_ID" --argjson adopt "$ADOPT" '{action:"bind",toolId:$id,adopt:$adopt}')"
+          status="$(curl -s --max-time 100 -o "$RUNNER_TEMP/admin-response.json" -w '%{http_code}' \
+            -H "Authorization: Bearer $token" -H 'Content-Type: application/json' --data "$body" "$PIFLOW_RELEASE_API/ToolAdmin")"
+          unset token
+          if [[ "$status" != 200 ]]; then echo "::error::ToolAdmin refused (HTTP $status)."; exit 1; fi
+          echo 'Repository binding completed.' >> "$GITHUB_STEP_SUMMARY"

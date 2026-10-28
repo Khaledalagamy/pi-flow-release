@@ -1,0 +1,128 @@
+name: Release a sealed Pi-Flow tool
+on:
+  workflow_call:
+    inputs:
+      project:
+        type: string
+        required: true
+      tests:
+        type: string
+        default: ''
+env:
+  PIFLOW_RELEASE_API: https://piflow-release-api.azurewebsites.net/api
+permissions: {}
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      sealed_sha256: ${{ steps.seal.outputs.sealed_sha256 }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Checkout reviewed shared helpers
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: Khaledalagamy/pi-flow-release
+          ref: c95a7f3f6ab51509b3f6613e10d4804f097c7c4b
+          path: .piflow-shared
+          persist-credentials: false
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: 10.0.x
+      - name: Build, inspect and seal on this runner
+        id: seal
+        shell: pwsh
+        env:
+          PIFLOW_PROJECT: ${{ inputs.project }}
+          PIFLOW_TESTS: ${{ inputs.tests }}
+          PIFLOW_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          PIFLOW_PACKAGES_TOKEN: ${{ github.token }}
+        run: '& "$env:GITHUB_WORKSPACE/.piflow-shared/actions/build.ps1" -Project $env:PIFLOW_PROJECT -Tests $env:PIFLOW_TESTS'
+      - name: Upload ciphertext only
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pi-flow-sealed-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release.pfs
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: pi-flow-release-${{ github.repository }}-${{ github.ref }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: pi-flow-sealed-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/sealed
+      # No checkout, shell helper, tool code, package, or cache is used by this job.
+      - name: Publish using a fresh OIDC token for each request
+        shell: bash
+        env:
+          SEALED_SHA256: ${{ needs.build.outputs.sealed_sha256 }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          file="$RUNNER_TEMP/sealed/release.pfs"
+          [[ "$SEALED_SHA256" =~ ^[a-f0-9]{64}$ ]] || fail 'Invalid sealed hash.'
+          [[ "$(find "$RUNNER_TEMP/sealed" -type f | wc -l)" -eq 1 ]] || fail 'Unexpected artifact files.'
+          [[ "$(sha256sum "$file" | cut -d' ' -f1)" == "$SEALED_SHA256" ]] || fail 'Sealed hash mismatch.'
+          size="$(stat -c %s "$file")"
+          (( size > 8 && size <= 67108864 )) || fail 'Invalid sealed size.'
+          response="$RUNNER_TEMP/release-response.json"
+          oidc() {
+            token="$(curl -fsS --max-time 30 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=pi-flow-tool-release" 2>/dev/null | jq -er '.value' 2>/dev/null)" || fail 'OIDC request failed.'
+            [[ "$token" =~ ^[A-Za-z0-9_.-]+$ ]] || fail 'Invalid OIDC response.'
+            echo "::add-mask::$token"
+          }
+          request() {
+            oidc
+            status="$(curl -s --max-time 100 -o "$response" -w '%{http_code}' \
+              -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
+              --data "$2" "$PIFLOW_RELEASE_API/$1")" || fail 'Release API request failed.'
+            unset token
+          }
+          request BeginToolRelease "$(jq -nc --arg hash "$SEALED_SHA256" --argjson size "$size" '{sealedSha256:$hash,sealedSize:$size}')"
+          if [[ "$status" == 409 ]]; then
+            reason="$(jq -er '.reason' "$response" 2>/dev/null)" || fail 'Invalid release response.'
+            sha="$(jq -r '.sha // ""' "$response" 2>/dev/null)"
+            if [[ "$reason" == version_exists && "$sha" == "$GITHUB_SHA" ]]; then
+              echo 'This version is already finalized from this commit.' >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            fail 'Version already exists from a different commit, or another release is in progress.'
+          fi
+          [[ "$status" == 200 ]] || fail "BeginToolRelease refused (HTTP $status)."
+          release_id="$(jq -er '.releaseId' "$response" 2>/dev/null)" || fail 'Missing release id.'
+          upload_url="$(jq -er '.uploadUrl' "$response" 2>/dev/null)" || fail 'Missing intake URL.'
+          echo "::add-mask::$upload_url"
+          [[ "$release_id" =~ ^[a-f0-9]{32}$ ]] || fail 'Invalid release id.'
+          [[ "$upload_url" == "https://piflowtoolbins.blob.core.windows.net/intake/$release_id.pfs?"* ]] || fail 'Invalid intake destination.'
+          upload_status="$(curl -s --max-time 180 -o /dev/null -w '%{http_code}' -X PUT \
+            -H 'x-ms-blob-type: BlockBlob' -H 'If-None-Match: *' --data-binary "@$file" "$upload_url")" || fail 'Intake upload failed.'
+          unset upload_url
+          [[ "$upload_status" == 201 ]] || fail "Intake upload refused (HTTP $upload_status)."
+          body="$(jq -nc --arg id "$release_id" '{releaseId:$id}')"
+          deadline=$((SECONDS + 600))
+          while true; do
+            request FinalizeToolRelease "$body"
+            if [[ "$status" == 200 ]]; then
+              jq -e '{toolId,version,channels,binSha256}' "$response" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || fail 'Invalid final result.'
+              break
+            fi
+            [[ "$status" == 202 && "$SECONDS" -lt "$deadline" ]] || fail "FinalizeToolRelease refused or timed out (HTTP $status)."
+            sleep 10
+          done
