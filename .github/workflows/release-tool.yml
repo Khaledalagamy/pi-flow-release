@@ -82,6 +82,11 @@ jobs:
           size="$(stat -c %s "$file")"
           (( size > 8 && size <= 67108864 )) || fail 'Invalid sealed size.'
           response="$RUNNER_TEMP/release-response.json"
+          fail_api() {
+            reason="$(jq -r '.reason // "release_unavailable"' "$response" 2>/dev/null)" || reason=release_unavailable
+            [[ "$reason" =~ ^[a-z0-9_:]{1,100}$ ]] || reason=release_unavailable
+            fail "$1: $reason (HTTP $status)."
+          }
           oidc() {
             token="$(curl -fsS --max-time 30 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
               "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=pi-flow-tool-release" 2>/dev/null | jq -er '.value' 2>/dev/null)" || fail 'OIDC request failed.'
@@ -90,7 +95,7 @@ jobs:
           }
           request() {
             oidc
-            status="$(curl -s --max-time 100 -o "$response" -w '%{http_code}' \
+            status="$(curl -s --max-time 330 -o "$response" -w '%{http_code}' \
               -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
               --data "$2" "$PIFLOW_RELEASE_API/$1")" || fail 'Release API request failed.'
             unset token
@@ -105,7 +110,7 @@ jobs:
             fi
             fail 'Version already exists from a different commit, or another release is in progress.'
           fi
-          [[ "$status" == 200 ]] || fail "BeginToolRelease refused (HTTP $status)."
+          [[ "$status" == 200 ]] || fail_api 'BeginToolRelease refused'
           release_id="$(jq -er '.releaseId' "$response" 2>/dev/null)" || fail 'Missing release id.'
           upload_url="$(jq -er '.uploadUrl' "$response" 2>/dev/null)" || fail 'Missing intake URL.'
           echo "::add-mask::$upload_url"
@@ -123,6 +128,6 @@ jobs:
               jq -e '{toolId,version,channels,binSha256}' "$response" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || fail 'Invalid final result.'
               break
             fi
-            [[ "$status" == 202 && "$SECONDS" -lt "$deadline" ]] || fail "FinalizeToolRelease refused or timed out (HTTP $status)."
+            [[ "$status" == 202 && "$SECONDS" -lt "$deadline" ]] || fail_api 'FinalizeToolRelease refused or timed out'
             sleep 10
           done

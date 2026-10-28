@@ -32,5 +32,10 @@ jobs:
           status="$(curl -s --max-time 100 -o "$RUNNER_TEMP/admin-response.json" -w '%{http_code}' \
             -H "Authorization: Bearer $token" -H 'Content-Type: application/json' --data "$body" "$PIFLOW_RELEASE_API/ToolAdmin")"
           unset token
-          if [[ "$status" != 200 ]]; then echo "::error::ToolAdmin refused (HTTP $status)."; exit 1; fi
+          if [[ "$status" != 200 ]]; then
+            reason="$(jq -r '.reason // "release_unavailable"' "$RUNNER_TEMP/admin-response.json" 2>/dev/null)" || reason=release_unavailable
+            [[ "$reason" =~ ^[a-z0-9_:]{1,100}$ ]] || reason=release_unavailable
+            echo "::error::ToolAdmin refused: $reason (HTTP $status)."
+            exit 1
+          fi
           echo 'Repository binding completed.' >> "$GITHUB_STEP_SUMMARY"
