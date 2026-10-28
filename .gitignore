@@ -1,0 +1,9 @@
+**/bin/
+**/obj/
+*.dll
+*.pdb
+*.bin
+*.pfs
+*.key
+.env*
+.DS_Store

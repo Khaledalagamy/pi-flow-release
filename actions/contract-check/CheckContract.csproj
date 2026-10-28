@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Checks a built Pi-Flow tool DLL against the connector's contract, without loading it (System.Reflection.Metadata).
+       Runs on Windows, macOS and Linux. How to run it: see Program.cs and docs/03-launch-contract.md. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>check-contract</AssemblyName>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- fixtures/BadTool is a deliberately broken tool, built on its own, to prove the checks catch each mistake. -->
+    <Compile Remove="fixtures/**" />
+    <EmbeddedResource Include="framework-assemblies.txt" LogicalName="framework-assemblies.txt" />
+  </ItemGroup>
+</Project>
