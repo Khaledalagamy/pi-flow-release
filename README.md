@@ -20,4 +20,6 @@ Run `dotnet run --project tests/Seal.Tests -c Release -p:RestoreLockedMode=true`
 
 Windows builds set `DebugType=none`, `DebugSymbols=false`, and `Deterministic=false`: the binding contract rejects every PE debug-directory entry, including the reproducible-build marker normally emitted by a deterministic .NET build.
 
+The restore uses a temporary nuget.config that maps `PiFlow.*` to the piflow feed only and everything else to nuget.org, as each tool's own nuget.config does. The contract check also applies the release API's manifest rules (only the fields a release reads, `name` at most 36 characters, `description` ending with a full stop, `entryClass` ending in `.ToolEntry` with `entryMethod` `Execute`, `isMcpTool` false), so a manifest the API would refuse fails the build before anything is sealed or uploaded.
+
 Activation requires the release API’s Spark-compatible replay cleanup, the owner-managed Firestore index, reviewed SHA allow-lists, and a one-time bind per tool. Billing stays disabled; no Firestore TTL is required. Delivery to Civil 3D additionally needs Steps 2 and 3. A stable manifest with `security: true` currently fails closed unless the release identity can read the existing `tp-{h12}` policy. Its deployed write-only secret role cannot do that; no permission is widened by this repository. Never grant it read access to `tk-*` AES key secrets.

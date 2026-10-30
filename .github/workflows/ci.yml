@@ -61,4 +61,28 @@ jobs:
           $sealed = [IO.File]::ReadAllBytes("$env:RUNNER_TEMP/release.pfs")
           if ([Text.Encoding]::ASCII.GetString($sealed[0..3]) -ne 'PFS1') { throw 'Rehearsal did not produce PFS1.' }
           if ((Get-Content $env:GITHUB_OUTPUT -Raw) -notmatch 'sealed_sha256=[a-f0-9]{64}') { throw 'Missing sealed digest.' }
+          if (-not (Get-Content "$env:RUNNER_TEMP/piflow-nuget.config" -Raw).Contains('<packageSource key="piflow"><package pattern="PiFlow.*" /></packageSource>')) { throw 'PiFlow.* is not mapped to the piflow feed.' }
           Remove-Item "$env:RUNNER_TEMP/release.pfs"
+      - name: Refuse manifests the release API refuses
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $fixture = "$env:RUNNER_TEMP/tool-fixture"
+          $dll = (dotnet msbuild "$fixture/Fixture.csproj" -getProperty:TargetPath -p:Configuration=Release).Trim()
+          $good = Get-Content "$fixture/piflow-tool.json" -Raw
+          $cases = [ordered]@{
+            manifest_fields = $good.Replace('"isMcpTool":false', '"isMcpTool":false,"envKey":"X"')
+            manifest_name = $good.Replace('"Fixture Tool"', '"' + ('N' * 37) + '"')
+            manifest_description = $good.Replace('rehearsal."', 'rehearsal"')
+            manifest_entry = $good.Replace('"Execute"', '"Run"')
+            manifest_mcp = $good.Replace('"isMcpTool":false', '"isMcpTool":true')
+          }
+          foreach ($rule in $cases.Keys) {
+            if ($cases[$rule] -eq $good) { throw "The $rule case did not change the manifest." }
+            $path = "$env:RUNNER_TEMP/manifest-$rule.json"
+            Set-Content -LiteralPath $path -Value $cases[$rule] -NoNewline
+            $report = dotnet run --project actions/contract-check/CheckContract.csproj -c Release --no-build -- $dll --manifest $path
+            if (-not $LASTEXITCODE -or -not ($report -like "FAIL *($rule)*")) { throw "The contract check accepted a manifest the release API refuses with $rule." }
+          }
+          # Each case's expected failure leaves LASTEXITCODE set, and the runner exits with it.
+          $global:LASTEXITCODE = 0
