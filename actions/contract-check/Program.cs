@@ -4,14 +4,16 @@
 //       [--allow <AssemblyName>]...      also allow a reference (only for an un-merged build, e.g. CommunityToolkit.Mvvm)
 //       [--expect-version <x.y.z>]       the DLL must be stamped with this version (release builds)
 //
-// It reads the DLL's metadata (System.Reflection.Metadata) and never loads or runs it. Each line is "ok" or "FAIL"; the
-// exit code is the number of failures (0 = fits). What each rule protects is in docs/03-launch-contract.md, with the
-// connector's file:line for each one.
+// It reads the DLL's metadata (System.Reflection.Metadata) and never loads or runs it, and reads piflow-tool.json by the
+// release API's own rules (the backend's src/PiFlow.ToolContract/Manifest.cs). Each line is "ok" or "FAIL"; the exit code
+// is the number of failures (0 = fits). What each rule protects is in docs/03-launch-contract.md, with the connector's
+// file:line for each one.
 
 using System.Reflection;
 using System.Reflection.Metadata;
 using System.Reflection.PortableExecutable;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 
 if (args.Length == 0 || args[0] is "-h" or "--help")
 {
@@ -35,8 +37,28 @@ for (int i = 1; i < args.Length; i++)
 if (manifestPath == null) { Console.Error.WriteLine("--manifest piflow-tool.json is required"); return 2; }
 if (!File.Exists(dllPath)) { Console.Error.WriteLine($"no such file: {dllPath}"); return 2; }
 
-var manifest = JsonDocument.Parse(File.ReadAllText(manifestPath)).RootElement;
-string Field(string name) => manifest.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString()! : "";
+// The exact bytes the seal carries, parsed as the release API parses them. Parse does not decode names and strings, so
+// every one is read here: invalid UTF-8 or a lone surrogate is a FAIL, not a crash later.
+byte[] manifestBytes = File.ReadAllBytes(manifestPath);
+JsonElement manifest;
+try
+{
+    manifest = JsonDocument.Parse(manifestBytes, new JsonDocumentOptions { MaxDepth = 16 }).RootElement;
+    Decode(manifest);
+}
+catch (Exception e) when (e is JsonException or InvalidOperationException)
+{
+    Console.WriteLine($"FAIL piflow-tool.json is not JSON text: {e.Message}");
+    return 1;
+}
+static void Decode(JsonElement e)
+{
+    if (e.ValueKind == JsonValueKind.Object) foreach (var p in e.EnumerateObject()) { _ = p.Name; Decode(p.Value); }
+    else if (e.ValueKind == JsonValueKind.Array) foreach (var x in e.EnumerateArray()) Decode(x);
+    else if (e.ValueKind == JsonValueKind.String) _ = e.GetString();
+}
+bool manifestIsObject = manifest.ValueKind == JsonValueKind.Object;
+string Field(string name) => manifestIsObject && manifest.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString()! : "";
 string entryClass = Field("entryClass"), entryMethod = Field("entryMethod");
 
 int fails = 0;
@@ -52,6 +74,55 @@ if (!pe.HasMetadata) { Console.WriteLine("FAIL not a .NET assembly: " + dllPath)
 MetadataReader md = pe.GetMetadataReader();
 string assemblyName = md.GetString(md.GetAssemblyDefinition().Name);
 Console.WriteLine($"check-contract: {Path.GetFileName(dllPath)} (assembly {assemblyName})");
+
+// ── 0. The manifest, by the release API's rules (backend src/PiFlow.ToolContract/Manifest.cs) ───────────
+// The API reads it only after the build was sealed and uploaded, and refuses it as contract_failed:<rule>; each line
+// names that rule. The API also matches toolId to the repository's binding, and build.ps1 matches version to the tag.
+Check(manifestBytes.Length <= 256 * 1024, "piflow-tool.json is at most 256 KB (manifest_size)");
+Check(manifestIsObject, "piflow-tool.json is a JSON object (manifest_object)");
+if (manifestIsObject)
+{
+    string[] fields = ["toolId", "name", "description", "category", "subcategory", "discipline", "version",
+        "entryClass", "entryMethod", "commandName", "isMcpTool", "security"];
+    var seen = new HashSet<string>(StringComparer.Ordinal);
+    var badFields = manifest.EnumerateObject().Select(p => p.Name).Where(n => !seen.Add(n) || !fields.Contains(n)).Distinct().ToList();
+    Check(badFields.Count == 0, "piflow-tool.json has only the fields a release reads, each once (manifest_fields)"
+        + (badFields.Count == 0 ? "" : ": " + string.Join(", ", badFields)));
+
+    // Text fields: required ones set, optional ones may be left out or empty; none longer than its limit or with control characters.
+    (string Name, int Max, bool Optional)[] texts =
+    [
+        ("toolId", 128, false), ("name", 36, false), ("description", 200, false), ("category", 128, false),
+        ("subcategory", 128, true), ("discipline", 128, true), ("version", 64, false), ("entryClass", 256, false),
+        ("entryMethod", 64, false), ("commandName", 128, true),
+    ];
+    var badTexts = new List<string>();
+    foreach (var (name, max, optional) in texts)
+    {
+        if (!manifest.TryGetProperty(name, out var v)) { if (!optional) badTexts.Add($"{name} is missing (manifest_{name})"); continue; }
+        string? text = v.ValueKind == JsonValueKind.String ? v.GetString() : null;
+        string? problem = text == null ? "is not text"
+            : text.Length > max ? $"is longer than {max} characters"
+            : !optional && string.IsNullOrWhiteSpace(text) ? "is empty"
+            : text.Any(char.IsControl) ? "has a control character" : null;
+        if (problem != null) badTexts.Add($"{name} {problem} (manifest_{name})");
+    }
+    Check(badTexts.Count == 0, badTexts.Count == 0
+        ? "text fields are set and short enough (name at most 36 characters, description 200)"
+        : "text fields: " + string.Join("; ", badTexts));
+
+    string toolId = Field("toolId");
+    Check(toolId.Length is > 0 and <= 128 && toolId != "MCP_tools" && !toolId.Contains("..", StringComparison.Ordinal)
+        && !string.IsNullOrWhiteSpace(toolId) && toolId.IndexOfAny("<>:\"/\\|?*".ToCharArray()) < 0 && !toolId.Any(char.IsControl),
+        $"toolId '{toolId}' is a valid tool ID (tool_id)");
+    Check(Regex.IsMatch(Field("version"), @"^\d+\.\d+\.\d+$"), $"version '{Field("version")}' is x.y.z (manifest_version)");
+    Check(Field("description").TrimEnd().EndsWith('.'), "description ends with a full stop (manifest_description)");
+    Check(entryClass.EndsWith(".ToolEntry", StringComparison.Ordinal) && entryMethod == "Execute",
+        $"entryClass ends in .ToolEntry and entryMethod is Execute: '{entryClass}.{entryMethod}' (manifest_entry)");
+    Check(manifest.TryGetProperty("isMcpTool", out var mcp) && mcp.ValueKind == JsonValueKind.False, "isMcpTool is false (manifest_mcp)");
+    Check(!manifest.TryGetProperty("security", out var security) || security.ValueKind is JsonValueKind.True or JsonValueKind.False,
+        "security is left out, true or false (manifest_security)");
+}
 
 // ── Types, by the names the connector uses ──────────────────────────────────────────────────────────────
 // Full name as Assembly.GetType(string) reads it: Namespace.Outer+Inner. Simple name as Type.Name.

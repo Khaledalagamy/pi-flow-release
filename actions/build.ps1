@@ -16,7 +16,8 @@ $version = $env:GITHUB_REF.Substring('refs/tags/v'.Length)
 $stable = -not $version.Contains('-')
 $manifestPath = RepoFile 'piflow-tool.json'
 $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-if ($manifest.version -ne $baseVersion) { throw 'Manifest version must match the tag base.' }
+# Ordinal, as the release API compares it (-ne ignores case and culture: Arabic-Indic digits would equal 1.2.0).
+if (-not [string]::Equals($manifest.version, $baseVersion, [StringComparison]::Ordinal)) { throw 'Manifest version must match the tag base.' }
 if ($stable) {
     $branch = $env:PIFLOW_DEFAULT_BRANCH
     if ([string]::IsNullOrWhiteSpace($branch)) { throw 'Missing default branch.' }
@@ -34,7 +35,10 @@ $feed = ''
 foreach ($path in $projects) {
     if ((Get-Content -LiteralPath $path -Raw) -match '<PackageReference\s+[^>]*(Include|Update)="PiFlow\.') { $feed = '<add key="piflow" value="https://nuget.pkg.github.com/Khaledalagamy/index.json" />' }
 }
-Set-Content -LiteralPath $nuget -Value "<configuration><packageSources><clear /><add key=`"nuget.org`" value=`"https://api.nuget.org/v3/index.json`" />$feed</packageSources></configuration>"
+# As each tool's own nuget.config does: PiFlow.* only from the piflow feed (never a same-named nuget.org package), even
+# when the feed is not added and a PiFlow.* package arrives through another package; everything else from nuget.org.
+$mapping = '<packageSourceMapping><packageSource key="nuget.org"><package pattern="*" /></packageSource><packageSource key="piflow"><package pattern="PiFlow.*" /></packageSource></packageSourceMapping>'
+Set-Content -LiteralPath $nuget -Value "<configuration><packageSources><clear /><add key=`"nuget.org`" value=`"https://api.nuget.org/v3/index.json`" />$feed</packageSources>$mapping</configuration>"
 if ($feed) { $env:NuGetPackageSourceCredentials_piflow = "Username=$($env:GITHUB_ACTOR);Password=$($env:PIFLOW_PACKAGES_TOKEN);ValidAuthenticationTypes=Basic" }
 foreach ($path in $projects) {
     dotnet restore $path --locked-mode --configfile $nuget -p:UseApiPackages=true
